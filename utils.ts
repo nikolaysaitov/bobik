@@ -3,9 +3,6 @@ require('dotenv').config();
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
 
-
-//https://api.telegram.org/bot7778880932:AAH4GgboL0vtsNg8LHIfUHVpXgORpynBVp4/getUpdates
-
 export function sendTelegramMessage(message: string) {
     if (!BOT_TOKEN || !CHAT_ID) {
       console.error('BOT_TOKEN or CHAT_ID is not defined');

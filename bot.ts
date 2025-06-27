@@ -1,26 +1,33 @@
 import * as WebSocket from "ws";
-import { getRSIfromBinance } from "./api";
-import { sendTelegramMessage } from "./utils";
-
+import { getRSIfromBinance } from "./utils/api";
+import { TRADING_CONFIG, closeOrderLong, closeOrderShort, openOrderLong, openOrderShort, sendTelegramMessage } from "./utils/utils";
+import { getAccountBalance, getTrendFilter, placeOrder } from "./utils/orders";
+import { SubscribeMsg } from "./types/types";
 const WS_URL = "wss://ws.okx.com:8443/ws/v5/public";
-
-interface SubscribeMsg {
-  op: string;
-  args: Array<{
-    channel: string;
-    instId: string;
-  }>;
-}
 
 let orderBuy = { price: 0 };
 let orderSell = { price: 0 };
-let DEPOSIT: number = 10000;
+let DEPOSIT: number = 10000; //4 981,55 ₽
 let tick = 0;
 let RSI = 0;
 let openPosition = "";
+let TREND = "";
+console.log("TREND", TREND);
+const getBalance = async () => {
+  try {
+    const usdtBalance = await getAccountBalance("USDT");
+    console.log("USDT balance:", usdtBalance.data[0].details[0].cashBal);
+    DEPOSIT = usdtBalance.data[0].details[0].cashBal;
+    return usdtBalance.data[0].details[0].cashBal;
+  } catch (error) {
+    console.error("Error getting account balance:", error);
+  }
+};
 
-const PROFIT_TARGET = 0.015 * DEPOSIT;
-const STOP_LOSS = 0.005 * DEPOSIT;
+getBalance();
+
+const PROFIT_TARGET = TRADING_CONFIG.PROFIT_MULTIPLIER;
+const STOP_LOSS = TRADING_CONFIG.STOP_LOSS_MULTIPLIER;
 
 let tradeHistory: string[] = []; // хранит 'profit' или 'stop'
 let waitUntil: number = 0; // timestamp до которого ждать перед следующей сделкой
@@ -31,6 +38,7 @@ const getData = async () => {
     RSI = res ? res : 0;
     return res;
   } catch (error) {
+    sendTelegramMessage(`❌ Error placing order: ${error} | RSI: ${RSI} | DEPOSIT ${DEPOSIT}`);
     console.error("Ошибка при получении данных RSI:", error);
   }
 };
@@ -39,7 +47,7 @@ function start() {
   const ws = new WebSocket.WebSocket(WS_URL);
 
   ws.on("open", () => {
-    console.log("BOT_2 Connected to OKX WebSocket");
+    console.log("Connected to OKX WebSocket");
     const subscribeMsg: SubscribeMsg = {
       op: "subscribe",
       args: [
@@ -55,11 +63,13 @@ function start() {
 
   ws.on("message", async (data) => {
     await getData(); // RSI обновляется при каждом тике
+    const trend = await getTrendFilter();
+    TREND = trend;
 
     const msg = JSON.parse(data.toString());
 
     if (msg.event === "subscribe") {
-      console.log("BOT_2 Subscribed:", msg.arg);
+      console.log("Subscribed:", msg.arg);
       return;
     }
     if (msg.event === "error") {
@@ -73,69 +83,144 @@ function start() {
 
       // Проверка: если мы ждём — не открываем новые сделки
       const now = Date.now();
-      if (now < waitUntil) return;
 
       // ===== LONG logic =====
-      if (RSI > 60) {
-        if (orderBuy.price === 0) {
+
+      if (orderBuy.price === 0) {
+        if (RSI > 60) {
+          const trend = await getTrendFilter();
+          if (trend !== "uptrend") return; // Фильтр тренда
+          if (now < waitUntil) return;
           orderBuy.price = tick;
           openPosition = `LONG от ${tick}`;
-          console.log(`📈BOT_2  Открыт LONG по цене: ${tick} | RSI: ${RSI} | DEPOSIT ${DEPOSIT}`);
-        } else {
-          if (tick >= orderBuy.price + PROFIT_TARGET) {
-            console.log(`🟢BOT_2  TAKE PROFIT (LONG) ${tick}`);
-            DEPOSIT += PROFIT_TARGET;
-            orderBuy.price = 0;
-            openPosition = "";
 
-            tradeHistory.push("profit");
-            if (tradeHistory.length > 2) tradeHistory.shift();
-          } else if (tick <= orderBuy.price - STOP_LOSS) {
-            console.log(`❌BOT_2  STOP LOSS (LONG) ${tick}`);
-            DEPOSIT -= STOP_LOSS;
-            orderBuy.price = 0;
-            openPosition = "";
+          placeOrder(openOrderLong)
+            .then((result) => {
+              console.log("Order placed:", result);
+              if (result.code === "0") {
+                sendTelegramMessage(`📈 Открыт LONG по цене: ${tick} | RSI: ${RSI} | DEPOSIT ${DEPOSIT}`);
+              }
+            })
+            .catch((err) => {
+              console.error("Error placing order:", err);
+              sendTelegramMessage(`❌ Error placing order: ${err} | RSI: ${RSI} | DEPOSIT ${DEPOSIT}`);
+            });
+        }
+      } else {
+        if (tick >= orderBuy.price + PROFIT_TARGET) {
+          orderBuy.price = 0;
+          openPosition = "";
 
-            tradeHistory.push("stop");
-            if (tradeHistory.length > 2) tradeHistory.shift(); // сохраняем только последние 2
+          placeOrder(closeOrderLong)
+            .then((result) => {
+              console.log("Order placed:", result);
+              if (result.code === "0") {
+                sendTelegramMessage(`🟢 TAKE PROFIT (LONG) ${tick} | RSI: ${RSI} | DEPOSIT ${DEPOSIT}`);
+              }
+            })
+            .catch((err) => {
+              console.error("Error placing order:", err);
+              sendTelegramMessage(`❌ Error placing order: ${err} | RSI: ${RSI} | DEPOSIT ${DEPOSIT}`);
+            });
 
-            // Если две последние сделки были stop — ждем 3 минуты
-            if (tradeHistory[0] === "stop" && tradeHistory[1] === "stop") {
-              waitUntil = Date.now() + 3 * 60 * 1000;
-              console.log("⏸ BOT_2 Пауза 3 минуты после двух стопов подряд");
-            }
+          tradeHistory.push("profit");
+          if (tradeHistory.length > TRADING_CONFIG.TRADE_HISTORY_LENGTH) tradeHistory.shift();
+        } else if (tick <= orderBuy.price - STOP_LOSS) {
+          orderBuy.price = 0;
+          openPosition = "";
+
+          placeOrder(closeOrderLong)
+            .then((result) => {
+              console.log("Order placed:", result);
+              if (result.code === "0") {
+                sendTelegramMessage(`❌ STOP LOSS (LONG) ${tick} | RSI: ${RSI} | DEPOSIT ${DEPOSIT}`);
+              }
+            })
+            .catch((err) => {
+              console.error("Error placing order:", err);
+              sendTelegramMessage(`❌ Error placing order: ${err} | RSI: ${RSI} | DEPOSIT ${DEPOSIT}`);
+            });
+
+          tradeHistory.push("stop");
+          if (tradeHistory.length > TRADING_CONFIG.TRADE_HISTORY_LENGTH) tradeHistory.shift(); // сохраняем только последние 2
+
+          // Установка паузы на основе истории
+          const stops = tradeHistory.slice(-2).filter((entry) => entry === "stop").length;
+          if (stops === 2) {
+            waitUntil = Date.now() + TRADING_CONFIG.PAUSE_AFTER_TWO_STOPS;
+            sendTelegramMessage("⏸ Пауза 3 минуты после двух стопов подряд");
+          } else if (stops === 1) {
+            waitUntil = Date.now() + TRADING_CONFIG.PAUSE_AFTER_ONE_STOP;
+            sendTelegramMessage("⏸ Пауза 1 минута после одного стопа");
           }
         }
       }
 
       // ===== SHORT logic =====
-      else if (RSI < 40) {
-        if (orderSell.price === 0) {
+
+      if (orderSell.price === 0) {
+        if (RSI < 40) {
+          const trend = await getTrendFilter();
+          if (trend !== "downtrend") return; // Фильтр тренда
+          if (now < waitUntil) return;
           orderSell.price = tick;
           openPosition = `SHORT от ${tick}`;
-          console.log(`📉BOT_2  Открыт SHORT по цене: ${tick} | RSI: ${RSI} | DEPOSIT ${DEPOSIT}`);
-        } else {
-          if (tick <= orderSell.price - PROFIT_TARGET) {
-            console.log(`🟢BOT_2  TAKE PROFIT (SHORT) ${tick}`);
-            DEPOSIT += PROFIT_TARGET;
-            orderSell.price = 0;
-            openPosition = "";
+          placeOrder(openOrderShort)
+            .then((result) => {
+              console.log("Order placed:", result);
+              if (result.code === "0") {
+                sendTelegramMessage(`📉 Открыт SHORT по цене: ${tick} | RSI: ${RSI} | DEPOSIT ${DEPOSIT}`);
+              }
+            })
+            .catch((err) => {
+              console.error("Error placing order:", err);
+              sendTelegramMessage(`❌ Error placing order: ${err} | RSI: ${RSI} | DEPOSIT ${DEPOSIT}`);
+            });
+        }
+      } else {
+        if (tick <= orderSell.price - PROFIT_TARGET) {
+          orderSell.price = 0;
+          openPosition = "";
+          placeOrder(closeOrderShort)
+            .then((result) => {
+              console.log("Order placed:", result);
+              if (result.code === "0") {
+                sendTelegramMessage(`🟢TAKE PROFIT (SHORT) ${tick} | RSI: ${RSI} | DEPOSIT ${DEPOSIT}`);
+              }
+            })
+            .catch((err) => {
+              console.error("Error placing order:", err);
+              sendTelegramMessage(`❌ Error placing order: ${err} | RSI: ${RSI} | DEPOSIT ${DEPOSIT}`);
+            });
+          tradeHistory.push("profit");
+          if (tradeHistory.length > TRADING_CONFIG.TRADE_HISTORY_LENGTH) tradeHistory.shift();
+        } else if (tick >= orderSell.price + STOP_LOSS) {
+          orderSell.price = 0;
 
-            tradeHistory.push("profit");
-            if (tradeHistory.length > 2) tradeHistory.shift();
-          } else if (tick >= orderSell.price + STOP_LOSS) {
-            console.log(`❌BOT_2  STOP LOSS (SHORT) ${tick}`);
-            DEPOSIT -= STOP_LOSS;
-            orderSell.price = 0;
-            openPosition = "";
+          openPosition = "";
 
-            tradeHistory.push("stop");
-            if (tradeHistory.length > 2) tradeHistory.shift();
+          placeOrder(closeOrderShort)
+            .then((result) => {
+              console.log("Order placed:", result);
+              if (result.code === "0") {
+                sendTelegramMessage(`❌ STOP LOSS (SHORT) ${tick} | RSI: ${RSI} | DEPOSIT ${DEPOSIT}`);
+              }
+            })
+            .catch((err) => {
+              console.error("Error placing order:", err);
+              sendTelegramMessage(`❌ Error placing order: ${err} | RSI: ${RSI} | DEPOSIT ${DEPOSIT}`);
+            });
+          tradeHistory.push("stop");
+          if (tradeHistory.length > TRADING_CONFIG.TRADE_HISTORY_LENGTH) tradeHistory.shift();
 
-            if (tradeHistory[0] === "stop" && tradeHistory[1] === "stop") {
-              waitUntil = Date.now() + 3 * 60 * 1000;
-              console.log("⏸ BOT_2 Пауза 3 минуты после двух стопов подряд");
-            }
+          // Установка паузы на основе истории
+          const stops = tradeHistory.slice(-2).filter((entry) => entry === "stop").length;
+          if (stops === 2) {
+            waitUntil = Date.now() + TRADING_CONFIG.PAUSE_AFTER_TWO_STOPS;
+            sendTelegramMessage("⏸ Пауза 5 минут после двух стопов подряд");
+          } else if (stops === 1) {
+            waitUntil = Date.now() + TRADING_CONFIG.PAUSE_AFTER_ONE_STOP;
+            sendTelegramMessage("⏸ Пауза 2 минуты после одного стопа");
           }
         }
       }
@@ -144,7 +229,7 @@ function start() {
 
   ws.on("close", () => {
     console.log("BOT_2 WebSocket закрыт. Переподключение через 3 секунды...");
-    setTimeout(start, 3000);
+    setTimeout(start, TRADING_CONFIG.RECONNECT_DELAY);
   });
 
   ws.on("error", (err) => {
@@ -186,21 +271,13 @@ setInterval(() => {
     minimumFractionDigits: 0,
   }).format(+tick.toFixed(0));
 
-  const logLine = `BOT2 💰 DEPOSIT: ${formattedDeposit}| 📊 BTC/USDT: ${formattedTick}| 📉 RSI: ${RSI.toFixed(1)}| ${datePart.replace(
+  const logLine = `💰TREND: ${TREND} DEPOSIT: ${formattedDeposit}| 📊 BTC/USDT: ${formattedTick}| 📉 RSI: ${RSI.toFixed(1)}| ${datePart.replace(
     " г.",
     "г"
   )}, ${timePart}`;
-  console.log(logLine);
   sendTelegramMessage(logLine);
-
+  console.log(logLine);
   if (openPosition) {
-    console.log(`🟢🔴BOT_2  OpenPosition: ${openPosition}`);
-    sendTelegramMessage(`🟢🔴BOT2  OpenPosition: ${openPosition}`);
+    sendTelegramMessage(`🟢🔴OpenPosition: ${openPosition}`);
   }
-
-  if (RSI < 40) {
-    console.log("📉BOT_2  RSI < 40 — сигнал SHORT:", RSI);
-  } else if (RSI > 60) {
-    console.log("📈BOT_2  RSI > 60 — сигнал LONG:", RSI);
-  }
-}, 1800000);
+}, TRADING_CONFIG.LOG_INTERVAL);
